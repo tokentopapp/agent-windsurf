@@ -1,6 +1,4 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import {
   createAgentPlugin,
   type AgentFetchContext,
@@ -8,9 +6,10 @@ import {
   type SessionParseOptions,
   type SessionUsageData,
 } from '@tokentop/plugin-sdk';
-
-// TODO: Implement session parsing for Windsurf
-// See @tokentop/agent-opencode for a complete reference implementation.
+import { CACHE_TTL_MS, SESSION_AGGREGATE_CACHE_MAX, sessionAggregateCache, sessionCache, sessionMetadataIndex } from './cache.ts';
+import { parseSessionsFromProjects } from './parser.ts';
+import { WINDSURF_CASCADE_PATH, WINDSURF_CODEIUM_DIR, WINDSURF_CONFIG_PATH } from './paths.ts';
+import { RECONCILIATION_INTERVAL_MS, startActivityWatch, stopActivityWatch } from './watcher.ts';
 
 const windsurfAgentPlugin = createAgentPlugin({
   id: 'windsurf',
@@ -26,31 +25,51 @@ const windsurfAgentPlugin = createAgentPlugin({
   permissions: {
     filesystem: {
       read: true,
-      paths: ['~/.windsurf', '~/.codeium'],
+      paths: ['~/.codeium', '~/.windsurf'],
     },
   },
 
   agent: {
     name: 'Windsurf',
     command: 'windsurf',
-    configPath: path.join(os.homedir(), '.windsurf'),
-    sessionPath: path.join(os.homedir(), '.windsurf'),
+    configPath: WINDSURF_CONFIG_PATH,
+    sessionPath: WINDSURF_CASCADE_PATH,
   },
 
   capabilities: {
-    sessionParsing: false,
+    sessionParsing: true,
     authReading: false,
-    realTimeTracking: false,
-    multiProvider: false,
+    realTimeTracking: true,
+    multiProvider: true,
+  },
+
+  startActivityWatch(_ctx: PluginContext, callback): void {
+    startActivityWatch(callback);
+  },
+
+  stopActivityWatch(_ctx: PluginContext): void {
+    stopActivityWatch();
   },
 
   async isInstalled(_ctx: PluginContext): Promise<boolean> {
-    return fs.existsSync(path.join(os.homedir(), '.windsurf')) || fs.existsSync(path.join(os.homedir(), '.codeium'));
+    return fs.existsSync(WINDSURF_CASCADE_PATH) || fs.existsSync(WINDSURF_CODEIUM_DIR);
   },
 
-  async parseSessions(_options: SessionParseOptions, _ctx: AgentFetchContext): Promise<SessionUsageData[]> {
-    return [];
+  async parseSessions(options: SessionParseOptions, ctx: AgentFetchContext): Promise<SessionUsageData[]> {
+    return parseSessionsFromProjects(options, ctx);
   },
 });
+
+export {
+  CACHE_TTL_MS,
+  RECONCILIATION_INTERVAL_MS,
+  SESSION_AGGREGATE_CACHE_MAX,
+  WINDSURF_CASCADE_PATH,
+  WINDSURF_CODEIUM_DIR,
+  WINDSURF_CONFIG_PATH,
+  sessionAggregateCache,
+  sessionCache,
+  sessionMetadataIndex,
+};
 
 export default windsurfAgentPlugin;

@@ -1,0 +1,268 @@
+# AGENTS.md — @tokentop/agent-windsurf
+
+## What is TokenTop?
+
+[TokenTop](https://github.com/tokentopapp/tokentop) is a terminal-based dashboard for monitoring
+AI token usage and costs across providers and coding agents. It uses a plugin architecture
+(`@tokentop/plugin-sdk`) with four plugin types: **provider** (API cost fetching), **agent**
+(session parsing), **theme** (TUI colors), and **notification** (alerts).
+
+This package is an **agent plugin**. Agent plugins parse local session files written by coding
+agents (Claude Code, Cursor, etc.) to extract per-turn token usage, then feed normalized
+`SessionUsageData` rows back to the TokenTop core for display. This plugin specifically tracks
+Windsurf (Codeium) editor session usage.
+
+## Build & Run
+
+```bash
+bun install                  # Install dependencies
+bun run build                # Full build (types + JS bundle)
+bun run build:types          # tsc --emitDeclarationOnly
+bun run build:js             # bun build → dist/
+bun run typecheck            # tsc --noEmit (strict)
+bun test                     # Run all tests (bun test runner)
+bun test src/parser.test.ts  # Run a single test file
+bun test --watch             # Watch mode
+```
+
+CI runs `bun run build` then `bun run typecheck`. Both must pass.
+
+## Project Structure
+
+| File | Responsibility |
+|------|---------------|
+| `src/index.ts` | Plugin entry point — `createAgentPlugin()` factory, lifecycle method wiring, re-exports public API |
+| `src/parser.ts` | Session parsing — `parseSessionsFromProjects()` with caching/dirty-tracking, `parseConversationFile()` for per-file extraction |
+| `src/cache.ts` | TTL session cache (2 s), LRU aggregate cache (10 000 max), metadata index for stat avoidance, eviction |
+| `src/paths.ts` | Path constants (`WINDSURF_CASCADE_PATH`, `WINDSURF_CODEIUM_DIR`), cascade file/dir discovery helpers |
+| `src/types.ts` | Shared interfaces — `WindsurfMessageEntry`, `WindsurfConversationData`, `ModelMapping`, `SessionAggregateCacheEntry` |
+| `src/utils.ts` | Model map (130+ definitions across 12 providers), JSON readers, `estimateTokenCount()`, `extractTextContent()`, `resolveModel()` |
+| `src/watcher.ts` | File system watchers — session dirty-path tracking, activity delta reads with file-offset bookkeeping |
+
+## Architecture Notes
+
+### Data Storage
+
+Windsurf (Codeium) stores AI conversation data at `~/.codeium/windsurf/cascade/`. Each
+conversation is a JSON file containing messages, metadata, and optional workspace context.
+Files may live directly in the cascade directory or within subdirectories. The plugin scans
+both levels during discovery.
+
+Key paths:
+- `WINDSURF_CODEIUM_DIR` — `~/.codeium`
+- `WINDSURF_CONFIG_PATH` — `~/.codeium/windsurf`
+- `WINDSURF_CASCADE_PATH` — `~/.codeium/windsurf/cascade/`
+
+Cross-platform application support paths are also tracked (macOS `~/Library/Application Support/Windsurf`,
+Linux `~/.config/Windsurf`, Windows `%APPDATA%/Windsurf`).
+
+### Token Estimation
+
+Windsurf does **not** provide actual token counts in its conversation files. All token values
+are estimated using `estimateTokenCount(text)` which applies the heuristic `Math.ceil(text.length / 4)`.
+Estimated costs in TokenTop are displayed with the `~` indicator.
+
+Input tokens are estimated from the last user message preceding each assistant turn. Output
+tokens are estimated from the assistant message text. `extractTextContent()` handles both
+string content and array-of-blocks content formats.
+
+### Model Mapping & Multi-Provider
+
+Windsurf supports many model providers through its routing layer. The `MODEL_MAP` contains
+130+ model definitions across 12 providers: Anthropic, OpenAI, Google, DeepSeek, Meta,
+Alibaba, xAI, Codeium, Mistral, Moonshot, ZhiPu, and MiniMax.
+
+`resolveModel(rawModelId)` performs:
+1. Direct lookup in MODEL_MAP (case-insensitive)
+2. Heuristic fallback matching by provider keyword (e.g. "claude" → anthropic, "gpt" → openai)
+3. Final fallback to `{ providerId: 'unknown', modelId: rawModelId }`
+
+This enables `multiProvider: true` in the plugin capabilities.
+
+### Caching Strategy
+
+Three cache layers minimize filesystem I/O:
+
+1. **Session cache** (`sessionCache`) — TTL-based (2 s). Returns the previous `parseSessions()`
+   result if parameters match and TTL hasn't expired. Bypassed for single-session queries.
+
+2. **Aggregate cache** (`sessionAggregateCache`) — Maps sessionId → parsed usage rows.
+   Keyed by session identifier, invalidated when file mtime changes. LRU eviction at
+   10 000 entries.
+
+3. **Metadata index** (`sessionMetadataIndex`) — Maps filePath → `{ mtimeMs, sessionId }`.
+   Allows stat avoidance: if a file isn't dirty and metadata is cached, skip the `fs.stat()`.
+   Stale entries are pruned each parse cycle.
+
+### Real-Time Watching
+
+Two watcher systems run in parallel:
+
+**Session watcher** (for `parseSessions` optimization):
+- `fs.watch()` on the cascade directory and discovered subdirectories
+- Changed `.json` files are added to a `dirtyPaths` set
+- New subdirectories trigger `watchSubDir()` for nested file tracking
+- A reconciliation timer forces a full stat sweep every 10 minutes
+
+**Activity watcher** (for `startActivityWatch` real-time updates):
+- Independent `fs.watch()` instances on the same directories
+- File-offset tracking: only reads the delta (new bytes) since last check
+- Parses delta chunks as JSON values, extracts assistant messages, emits `ActivityUpdate`
+- Offsets reset to 0 if file shrinks (rewrite detected)
+
+### Deduplication
+
+Message-level deduplication uses a `Map<messageId, SessionUsageData>`. Message IDs are:
+- **Natural**: `msg.id` when present in the conversation data
+- **Synthetic**: `${sessionId}-${timestamp}-${index}` when no natural ID exists
+
+This prevents duplicate rows when the same message appears across multiple parse cycles
+or in overlapping file reads.
+
+## TypeScript Configuration
+
+- **Strict mode**: `strict: true` — all strict checks enabled
+- **No unused code**: `noUnusedLocals`, `noUnusedParameters` both `true`
+- **No fallthrough**: `noFallthroughCasesInSwitch: true`
+- **Target**: ESNext, Module: ESNext, ModuleResolution: bundler
+- **Types**: `bun-types` (not `@types/node`)
+- **Declaration**: Emits `.d.ts` + declaration maps + source maps
+
+## Code Style
+
+### Imports
+
+- **Use `.ts` extensions** in all relative imports: `import { foo } from './bar.ts'`
+- **Type-only imports** use the `type` keyword:
+  ```typescript
+  import type { SessionUsageData } from '@tokentop/plugin-sdk';
+  import { createAgentPlugin, type AgentFetchContext } from '@tokentop/plugin-sdk';
+  ```
+- **Node.js modules** via namespace imports: `import * as fs from 'fs'`, `import * as path from 'path'`
+- **Order**: External packages → relative imports (no blank line separator used)
+
+### Module Format
+
+- ESM only (`"type": "module"` in package.json)
+- Named exports for everything except the main plugin (default export)
+- Re-export public API items explicitly from `index.ts`
+
+### Naming Conventions
+
+- **Constants**: `UPPER_SNAKE_CASE` — `CACHE_TTL_MS`, `RECONCILIATION_INTERVAL_MS`
+- **Functions**: `camelCase` — `parseSessionsFromProjects`, `readJsonlFile`
+- **Interfaces**: `PascalCase` — `WindsurfSessionEntry`, `SessionWatcherState`
+- **Type predicates**: `is` prefix — `isTokenBearingEntry(entry): entry is ...`
+- **Unused required params**: Underscore prefix — `_ctx: PluginContext`
+- **File names**: `kebab-case.ts`
+
+### Types
+
+- **Interfaces** for object shapes, not type aliases
+- **Explicit return types** on all exported functions
+- **Type predicates** for runtime validation guards (narrowing `unknown` → typed)
+- **`Partial<T>`** for candidate validation instead of `as any`
+- Never use `as any`, `@ts-ignore`, or `@ts-expect-error`
+- Validate unknown data at boundaries with type guard functions
+
+### Functions
+
+- **Functional style** — no classes. State held in module-level objects/Maps
+- **Pure functions** where possible; side effects isolated to watcher/cache modules
+- **Early returns** for guard clauses
+- **Async/await** throughout, no raw Promise chains
+
+### Error Handling
+
+- **Empty catch blocks are intentional** for graceful degradation (filesystem ops that may fail)
+- Pattern: `try { await fs.access(path); } catch { return []; }`
+- Never throw from filesystem operations — return empty/default values
+- Use `Number.isFinite()` for numeric validation, not `isNaN()`
+- Validate at data boundaries, trust within module
+
+### Formatting
+
+- No explicit formatter config (Prettier/ESLint not configured)
+- 2-space indentation (observed convention)
+- Single quotes for strings
+- Trailing commas in multiline structures
+- Semicolons always
+- Opening brace on same line
+
+## Plugin SDK Contract
+
+The plugin SDK (`@tokentop/plugin-sdk`) defines the interface contract between plugins and
+the TokenTop core (`~/development/tokentop/ttop`). The SDK repo lives at
+`~/development/tokentop/plugin-sdk`. This plugin is a peer dependency consumer — it declares
+`@tokentop/plugin-sdk` as a `peerDependency`, not a bundled dep.
+
+This plugin implements the `AgentPlugin` interface via the `createAgentPlugin()` factory:
+
+```typescript
+const plugin = createAgentPlugin({
+  id: 'windsurf',
+  type: 'agent',
+  agent: { name: 'Windsurf', command: 'windsurf', configPath, sessionPath },
+  capabilities: { sessionParsing: true, realTimeTracking: true, ... },
+  isInstalled(ctx) { ... },
+  parseSessions(options, ctx) { ... },
+  startActivityWatch(ctx, callback) { ... },
+  stopActivityWatch(ctx) { ... },
+});
+export default plugin;
+```
+
+### AgentPlugin interface (required methods)
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `isInstalled` | `(ctx: PluginContext) → Promise<boolean>` | Check if this agent exists on the user's machine |
+| `parseSessions` | `(options: SessionParseOptions, ctx: AgentFetchContext) → Promise<SessionUsageData[]>` | Parse session files into normalized usage rows |
+| `startActivityWatch` | `(ctx: PluginContext, callback: ActivityCallback) → void` | Begin real-time file watching, emit deltas |
+| `stopActivityWatch` | `(ctx: PluginContext) → void` | Tear down watchers |
+
+### Key SDK types
+
+| Type | Shape | Used for |
+|------|-------|----------|
+| `SessionUsageData` | `{ sessionId, providerId, modelId, tokens: { input, output, cacheRead?, cacheWrite? }, timestamp, sessionUpdatedAt?, projectPath?, sessionName? }` | Normalized per-turn usage row returned from `parseSessions` |
+| `ActivityUpdate` | `{ sessionId, messageId, tokens: { input, output, cacheRead?, cacheWrite? }, timestamp }` | Real-time delta emitted via `ActivityCallback` |
+| `SessionParseOptions` | `{ sessionId?, limit?, since?, timePeriod? }` | Filters passed by core to `parseSessions` |
+| `AgentFetchContext` | `{ http, logger, config, signal }` | Context bag — `ctx.logger` for debug logging |
+| `PluginContext` | `{ logger, storage, config, signal }` | Context for lifecycle methods |
+
+### SDK subpath imports
+
+| Import path | Use |
+|-------------|-----|
+| `@tokentop/plugin-sdk` | Everything (types + helpers) |
+| `@tokentop/plugin-sdk/types` | Type definitions only |
+| `@tokentop/plugin-sdk/testing` | `createTestContext()` for tests |
+
+## Commit Conventions
+
+Conventional Commits enforced by CI on both PR titles and commit messages:
+
+```
+feat(parser): add support for cache_creation breakdown
+fix(watcher): handle race condition in delta reads
+chore(deps): update dependencies
+refactor: simplify session metadata indexing
+```
+
+Valid prefixes: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
+Optional scope in parentheses. Breaking changes use `!` suffix before colon.
+
+## Release Process
+
+- semantic-release via GitHub Actions (currently manual `workflow_dispatch`)
+- Publishes to npm as `@tokentop/agent-windsurf` with public access + provenance
+- Runs `bun run clean && bun run build` before publish (`prepublishOnly`)
+- Branches: `main` only
+
+## Testing
+
+- Test runner: `bun test` (Bun's built-in test runner)
+- Test files: `*.test.ts` (excluded from tsconfig compilation, picked up by bun test)
+- Place test files adjacent to source: `src/parser.test.ts`
+- Use `createTestContext()` from `@tokentop/plugin-sdk/testing` for mock contexts
